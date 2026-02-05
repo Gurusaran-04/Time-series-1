@@ -1,0 +1,145 @@
+# =========================
+# 1. IMPORTS
+# =========================
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =========================
+# 2. DATA GENERATION
+# =========================
+np.random.seed(42)
+days = 3 * 365
+t = np.arange(days)
+
+data = pd.DataFrame({
+    "f1": np.sin(2*np.pi*t/30) + np.random.normal(0,0.1,days),
+    "f2": np.cos(2*np.pi*t/90) + np.random.normal(0,0.1,days),
+    "f3": 0.0005*t + np.random.normal(0,0.05,days),
+    "f4": np.random.normal(0,1,days),
+    "target": np.sin(2*np.pi*t/7) + 0.3*np.cos(2*np.pi*t/365)
+})
+
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data.values)
+
+# =========================
+# 3. DATASET CLASS (FIXED)
+# =========================
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, seq_len=30):
+        self.X = []
+        self.y = []
+        for i in range(len(data) - seq_len):
+            self.X.append(data[i:i+seq_len, :-1])
+            self.y.append(data[i+seq_len, -1])
+
+        self.X = torch.tensor(self.X, dtype=torch.float32)
+        self.y = torch.tensor(self.y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# =========================
+# 4. TRANSFORMER MODEL
+# =========================
+class TransformerModel(nn.Module):
+    def __init__(self, n_features, seq_len=30, d_model=64, nhead=4):
+        super().__init__()
+        self.embedding = nn.Linear(n_features, d_model)
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, d_model))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.fc = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.embedding(x) + self.pos_embedding
+        x = self.encoder(x)
+        return self.fc(x[:, -1, :]).squeeze()
+
+# =========================
+# 5. LSTM BASELINE
+# =========================
+class LSTMModel(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, 64, batch_first=True)
+        self.fc = nn.Linear(64, 1)
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1]).squeeze()
+
+# =========================
+# 6. TRAIN FUNCTION
+# =========================
+def train_model(model, loader, epochs=10):
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+
+    for _ in range(epochs):
+        for X, y in loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(X), y)
+            loss.backward()
+            optimizer.step()
+
+# =========================
+# 7. ROLLING ORIGIN CV (FIXED)
+# =========================
+def rolling_cv(model_class):
+    rmses, maes = [], []
+
+    for split in range(500, 900, 100):
+        train_data = data_scaled[:split]
+        test_data  = data_scaled[split:split+150]
+
+        train_ds = TimeSeriesDataset(train_data)
+        test_ds  = TimeSeriesDataset(test_data)
+
+        train_dl = DataLoader(train_ds, batch_size=32, shuffle=True)
+        test_dl  = DataLoader(test_ds, batch_size=32)
+
+        model = model_class(train_data.shape[1]-1).to(device)
+        train_model(model, train_dl)
+
+        model.eval()
+        preds, actuals = [], []
+
+        with torch.no_grad():
+            for X, y in test_dl:
+                X = X.to(device)
+                preds.extend(model(X).cpu().numpy())
+                actuals.extend(y.numpy())
+
+        rmses.append(np.sqrt(mean_squared_error(actuals, preds)))
+        maes.append(mean_absolute_error(actuals, preds))
+
+    return np.mean(rmses), np.mean(maes)
+
+# =========================
+# 8. EVALUATION
+# =========================
+tr_rmse, tr_mae = rolling_cv(TransformerModel)
+lstm_rmse, lstm_mae = rolling_cv(LSTMModel)
+
+print("Transformer RMSE:", tr_rmse)
+print("Transformer MAE :", tr_mae)
+print("LSTM RMSE       :", lstm_rmse)
+print("LSTM MAE        :", lstm_mae)
